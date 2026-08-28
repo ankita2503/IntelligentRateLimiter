@@ -184,7 +184,8 @@ limiter:
 
 ## Roadmap
 
-- [ ] Core token bucket + distributed atomic counters
+- [x] Core token bucket, per-client, in-memory
+- [ ] Distributed atomic counters (shared state across instances)
 - [ ] Telemetry collection and rolling SLO signals
 - [ ] AIMD controller and bounded budget adjustment
 - [ ] Per-client EWMA profiles and deviation detection
@@ -197,6 +198,72 @@ limiter:
 
 ---
 
+## Running it
+
+Requires JDK 21+ and Maven.
+
+```bash
+mvn test                                  # 15 tests, unit + integration
+mvn spring-boot:run                       # starts on :8080
+```
+
+Try the limit:
+
+```bash
+for i in $(seq 1 4); do
+  curl -s -o /dev/null -D - -H "X-API-Key: demo" http://localhost:8080/api/ping \
+    | grep -Ei "^(HTTP/|X-RateLimit|Retry-After)"
+done
+```
+
+The fourth call returns `429` with `Retry-After` and a problem-details body.
+Override any setting on the command line:
+
+```bash
+mvn spring-boot:run -Dspring-boot.run.arguments=--ratelimiter.limit=10
+```
+
+---
+
+## What exists today
+
+The **enforcement layer** is built; the **adaptation layer** is not. Concretely:
+
+| Piece | Status |
+|---|---|
+| Token bucket with continuous refill, per client key | Done |
+| Servlet filter, response headers, `429` + problem details | Done |
+| Cost-weighted accounting (`tryAcquire(key, cost)`) | Plumbed through, always charged 1 |
+| Fail-open on limiter failure | Done |
+| Idle bucket eviction so memory stays bounded | Done |
+| Limit derived from SLO feedback | Not started |
+| Per-client EWMA profiles, fair share, degradation ladder | Not started |
+| Shared state across instances | Not started — buckets are per-process |
+
+### Where the intelligence plugs in
+
+`LimitResolver` is the seam. It answers one question — *what is this client's limit
+right now?* — and today `StaticLimitResolver` returns the configured constant. Making
+the limiter adaptive means replacing that one bean with a resolver fed by the
+controller. The enforcement path does not change.
+
+```
+ai/assistiv/ratelimiter/
+├── core/
+│   ├── RateLimiter.java             # admission check, cost-aware
+│   ├── TokenBucketRateLimiter.java  # lock-free CAS bucket, per key
+│   ├── LimitResolver.java           # <- the adaptive seam
+│   ├── StaticLimitResolver.java     #    today: a constant
+│   ├── RateLimitDecision.java       # allowed, limit, remaining, retry-after, reason
+│   ├── LimitReason.java             # quota | system-pressure | client-deviation | fair-share
+│   └── TimeSource.java              # injectable clock, so refill is testable
+├── config/                          # properties, bean wiring, idle-bucket sweep
+└── web/                             # filter, key resolver, demo endpoint
+```
+
+---
+
 ## Status
 
-Early — this document defines the approach. Implementation follows the roadmap above.
+Early. The approach above is the target; a static token bucket is what runs today.
+See *What exists today* for the line between the two.
