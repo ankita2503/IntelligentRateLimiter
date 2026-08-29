@@ -18,7 +18,10 @@ public class RateLimitProperties {
 
     private boolean enabled = true;
 
-    /** Requests allowed per {@link #refillPeriod}, per client. */
+    /**
+     * Requests allowed per {@link #refillPeriod}, per client, when the adaptive
+     * layer is switched off. With it on, the limit is derived from traffic.
+     */
     private long limit = 100;
 
     /** The time it takes an empty bucket to refill completely. */
@@ -37,6 +40,8 @@ public class RateLimitProperties {
 
     /** Ant-style paths that bypass the limiter entirely. */
     private List<String> excludedPaths = List.of("/actuator/**");
+
+    private AdaptiveProperties adaptive = new AdaptiveProperties();
 
     public boolean isEnabled() {
         return enabled;
@@ -92,6 +97,14 @@ public class RateLimitProperties {
 
     public void setKeyHeader(String keyHeader) {
         this.keyHeader = keyHeader;
+    }
+
+    public AdaptiveProperties getAdaptive() {
+        return adaptive;
+    }
+
+    public void setAdaptive(AdaptiveProperties adaptive) {
+        this.adaptive = adaptive;
     }
 
     public List<String> getExcludedPaths() {

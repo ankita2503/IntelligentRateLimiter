@@ -50,7 +50,8 @@ public class TokenBucketRateLimiter implements RateLimiter {
         if (cost <= 0) {
             throw new IllegalArgumentException("cost must be positive");
         }
-        long limit = limitResolver.limitFor(key);
+        ResolvedLimit resolved = limitResolver.resolve(key);
+        long limit = resolved.limit();
         long capacityScaled = scale(limit);
         long costScaled = scale(cost);
         long now = time.nanoTime();
@@ -69,7 +70,7 @@ public class TokenBucketRateLimiter implements RateLimiter {
                 long waitNanos = nanosToAccumulate(costScaled - tokens, capacityScaled);
                 long retryAfter = Math.max(1, ceilDiv(waitNanos, 1_000_000_000L));
                 return RateLimitDecision.deny(limit, retryAfter, time.epochSecond() + retryAfter,
-                        LimitReason.QUOTA_EXCEEDED);
+                        resolved.constrainedBy());
             }
 
             Bucket next = new Bucket(tokens - costScaled, now);

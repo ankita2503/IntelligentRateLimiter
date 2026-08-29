@@ -1,8 +1,10 @@
 package ai.assistiv.ratelimiter.web;
 
+import ai.assistiv.ratelimiter.adaptive.TrafficMetrics;
 import ai.assistiv.ratelimiter.config.RateLimitProperties;
 import ai.assistiv.ratelimiter.core.RateLimitDecision;
 import ai.assistiv.ratelimiter.core.RateLimiter;
+import ai.assistiv.ratelimiter.core.TimeSource;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -20,9 +22,10 @@ import org.springframework.web.filter.OncePerRequestFilter;
 /**
  * Enforces the limit on the request hot path.
  *
- * <p>This filter only reads a decision and writes headers. All adaptation
- * belongs behind {@link ai.assistiv.ratelimiter.core.LimitResolver}, off this
- * path.
+ * <p>This filter only reads a decision, writes headers, and reports what
+ * happened. All adaptation belongs behind
+ * {@link ai.assistiv.ratelimiter.core.LimitResolver} and the control loop, off
+ * this path — the measurements taken here are what feed them.
  */
 public class RateLimitFilter extends OncePerRequestFilter {
 
@@ -30,13 +33,18 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
     private final RateLimiter rateLimiter;
     private final ClientKeyResolver keyResolver;
+    private final TrafficMetrics metrics;
+    private final TimeSource time;
     private final RateLimitProperties properties;
     private final AntPathMatcher pathMatcher = new AntPathMatcher();
 
     public RateLimitFilter(RateLimiter rateLimiter, ClientKeyResolver keyResolver,
+                           TrafficMetrics metrics, TimeSource time,
                            RateLimitProperties properties) {
         this.rateLimiter = rateLimiter;
         this.keyResolver = keyResolver;
+        this.metrics = metrics;
+        this.time = time;
         this.properties = properties;
     }
 
@@ -70,11 +78,24 @@ public class RateLimitFilter extends OncePerRequestFilter {
         }
 
         writeHeaders(response, decision);
-        if (decision.allowed()) {
-            chain.doFilter(request, response);
+        if (!decision.allowed()) {
+            metrics.recordRejection();
+            writeRejection(response, decision);
             return;
         }
-        writeRejection(response, decision);
+
+        // Timing the admitted request is what closes the loop: this latency is
+        // the signal the controller uses to decide the next budget.
+        metrics.requestStarted();
+        long startedAt = time.nanoTime();
+        boolean failed = true;
+        try {
+            chain.doFilter(request, response);
+            failed = response.getStatus() >= HttpStatus.INTERNAL_SERVER_ERROR.value();
+        } finally {
+            metrics.recordCompletion(time.nanoTime() - startedAt, failed);
+            metrics.requestFinished();
+        }
     }
 
     private void writeHeaders(HttpServletResponse response, RateLimitDecision decision) {

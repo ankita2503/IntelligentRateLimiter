@@ -15,6 +15,9 @@ import org.springframework.test.web.servlet.MockMvc;
 @SpringBootTest
 @AutoConfigureMockMvc
 @TestPropertySource(properties = {
+        // Enforcement is tested against a fixed limit; the adaptive layer has
+        // its own tests.
+        "ratelimiter.adaptive.enabled=false",
         "ratelimiter.limit=3",
         "ratelimiter.refill-period=60s"
 })

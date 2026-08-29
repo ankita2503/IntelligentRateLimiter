@@ -10,7 +10,7 @@ public class StaticLimitResolver implements LimitResolver {
     }
 
     @Override
-    public long limitFor(String key) {
-        return limit;
+    public ResolvedLimit resolve(String key) {
+        return ResolvedLimit.of(limit);
     }
 }

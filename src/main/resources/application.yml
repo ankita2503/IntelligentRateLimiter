@@ -9,11 +9,11 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info,metrics,ratelimiter
 
 ratelimiter:
   enabled: true
-  # Requests allowed per refill-period, per client.
+  # Only used when adaptive.enabled is false.
   limit: 100
   refill-period: 1m
   # Buckets untouched for this long are discarded.
@@ -24,6 +24,24 @@ ratelimiter:
   key-header: X-API-Key
   excluded-paths:
     - /actuator/**
+
+  adaptive:
+    enabled: true
+    # How fast the loop reacts, and how long it remembers.
+    control-interval: 1s
+    window: 30s
+    baseline-half-life: 5m
+    warmup-ticks: 20
+    # Safety rails. The controller may move freely between these and nowhere else.
+    min-budget: 50
+    max-budget: 5000
+    min-client-limit: 5
+    # Sensitivity: deviations above the learned baseline that count as anomalous.
+    deviation-sigma: 3.0
+    # Optional hard SLO. Zero means judge latency only against what it has been.
+    latency-ceiling: 0s
+    client-activity-window: 1m
+    client-idle-ttl: 15m
 
 logging:
   level:

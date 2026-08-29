@@ -3,7 +3,7 @@ package ai.assistiv.ratelimiter.core;
 import java.time.Duration;
 
 /** Manually advanced clock so refill behaviour is testable without sleeping. */
-class FakeTimeSource implements TimeSource {
+public class FakeTimeSource implements TimeSource {
 
     private long nanos = 1_000_000_000L;
     private long epochSecond = 1_700_000_000L;
@@ -18,7 +18,7 @@ class FakeTimeSource implements TimeSource {
         return epochSecond;
     }
 
-    void advance(Duration duration) {
+    public void advance(Duration duration) {
         nanos += duration.toNanos();
         epochSecond += duration.toSeconds();
     }

@@ -157,44 +157,55 @@ X-RateLimit-Reason: system-pressure   # or: client-deviation | fair-share | quot
 
 ---
 
-## Configuration sketch
+## Configuration
+
+The interesting property is what is **absent**. There is no request-per-minute
+number, no latency SLO, no tenant list, no per-client quota — those are derived
+from traffic. What remains is of three kinds: safety rails, time constants, and
+one sensitivity dial.
 
 ```yaml
-limiter:
-  slo:
-    p99_latency_ms: 250
-    max_error_rate: 0.01
-  bounds:
-    min_limit: 50          # never throttle below this
-    max_limit: 5000        # never grant above this
-  controller:
-    strategy: aimd         # aimd | pid | static
-    tick_ms: 1000
-    increase_step: 25      # additive, per tick
-    decrease_factor: 0.5   # multiplicative, on breach
-  fairness:
-    strategy: weighted_fair_share
-    tiers: { premium: 3, standard: 1, free: 0.25 }
-  cost:
-    enabled: true          # charge by measured cost, not request count
-  fail_mode: open
+ratelimiter:
+  refill-period: 1m
+  fail-mode: OPEN
+  key-header: X-API-Key
+  adaptive:
+    enabled: true
+    # Time constants: how fast to react, how long to remember.
+    control-interval: 1s
+    window: 30s
+    baseline-half-life: 5m
+    warmup-ticks: 20
+    # Safety rails: the controller moves freely between these and nowhere else.
+    min-budget: 50
+    max-budget: 5000
+    min-client-limit: 5
+    # Sensitivity: deviations above the learned baseline that count as anomalous.
+    deviation-sigma: 3.0
+    # Optional hard SLO. Zero means judge latency only against what it has been.
+    latency-ceiling: 0s
 ```
+
+Setting `adaptive.enabled: false` falls back to a fixed `ratelimiter.limit`,
+which is useful for comparison and for the enforcement tests.
 
 ---
 
 ## Roadmap
 
 - [x] Core token bucket, per-client, in-memory
-- [ ] Distributed atomic counters (shared state across instances)
-- [ ] Telemetry collection and rolling SLO signals
-- [ ] AIMD controller and bounded budget adjustment
-- [ ] Per-client EWMA profiles and deviation detection
-- [ ] Weighted fair share across tiers
-- [ ] Cost-weighted accounting
-- [ ] Degradation ladder + derived `Retry-After`
+- [x] Telemetry: sliding-window p99 latency, error rate, throughput, in-flight
+- [x] Learned baselines — the limiter discovers its own thresholds
+- [x] Slow-start + AIMD controller with bounded budget adjustment
+- [x] Per-client EWMA profiles and deviation detection
+- [x] Fair share across the observed client population
+- [x] Explainable denials (`X-RateLimit-Reason`) and a state endpoint
+- [ ] Weighted priority tiers on top of equal fair share
+- [ ] Cost-weighted accounting (the plumbing exists; every request charges 1)
+- [ ] Degradation ladder: shed-optional and queue steps before rejection
+- [ ] Distributed state, so instances share one budget
 - [ ] PID controller as an alternative strategy
-- [ ] Load-test harness: burst, sustained flood, noisy neighbor, degraded downstream
-- [ ] Reference middleware adapters
+- [ ] Load-test harness: burst, sustained flood, noisy neighbour, degraded downstream
 
 ---
 
@@ -223,47 +234,138 @@ Override any setting on the command line:
 mvn spring-boot:run -Dspring-boot.run.arguments=--ratelimiter.limit=10
 ```
 
+### Watching it adapt
+
+`/api/slow?ms=400` stands in for a degraded dependency, and
+`/actuator/ratelimiter` reports what the limiter has learned:
+
+```bash
+mvn spring-boot:run
+
+# what it currently believes
+curl -s localhost:8080/actuator/ratelimiter | python3 -m json.tool
+
+# healthy load: the budget climbs
+while true; do
+  for i in $(seq 1 25); do curl -s -o /dev/null -H "X-API-Key: load" localhost:8080/api/ping & done
+  wait
+done
+
+# then degrade the dependency and watch the budget collapse
+while true; do
+  for i in $(seq 1 25); do curl -s -o /dev/null -H "X-API-Key: load" "localhost:8080/api/slow?ms=400" & done
+  wait
+done
+```
+
+Shorten `window`, `baseline-half-life`, and `warmup-ticks` to see it react within
+seconds rather than minutes.
+
 ---
 
 ## What exists today
 
-The **enforcement layer** is built; the **adaptation layer** is not. Concretely:
+Both layers are built. Enforcement is a token bucket; the limit it enforces is
+produced by the adaptive layer on a one-second control loop.
 
 | Piece | Status |
 |---|---|
 | Token bucket with continuous refill, per client key | Done |
 | Servlet filter, response headers, `429` + problem details | Done |
-| Cost-weighted accounting (`tryAcquire(key, cost)`) | Plumbed through, always charged 1 |
-| Fail-open on limiter failure | Done |
-| Idle bucket eviction so memory stays bounded | Done |
-| Limit derived from SLO feedback | Not started |
-| Per-client EWMA profiles, fair share, degradation ladder | Not started |
+| Fail-open on limiter failure, idle bucket eviction | Done |
+| Sliding-window telemetry: p99, error rate, throughput, in-flight | Done |
+| Learned latency/error baselines — no configured SLO required | Done |
+| Slow-start + AIMD budget controller, bounded by rails | Done |
+| Per-client EWMA profiles and deviation scoring | Done |
+| Fair share across the observed client population | Done |
+| Explainable denials + `/actuator/ratelimiter` state endpoint | Done |
+| Weighted priority tiers | Not started — every client shares equally |
+| Cost-weighted accounting | Plumbed through `tryAcquire(key, cost)`, always 1 |
+| Shed-optional and queue steps of the degradation ladder | Not started |
 | Shared state across instances | Not started — buckets are per-process |
 
-### Where the intelligence plugs in
+### What is learned, and what is configured
 
-`LimitResolver` is the seam. It answers one question — *what is this client's limit
-right now?* — and today `StaticLimitResolver` returns the configured constant. Making
-the limiter adaptive means replacing that one bean with a resolver fed by the
-controller. The enforcement path does not change.
+This is the part that differs from a conventional limiter.
+
+| Quantity | Where it comes from |
+|---|---|
+| How much capacity exists | Discovered: slow start doubles the budget while healthy, AIMD from there |
+| What counts as "too slow" | Learned: EWMA mean + σ of this service's own p99 |
+| What counts as "too many errors" | Learned: same mechanism on error rate |
+| A client's normal request rate | Learned: EWMA per key, judged against itself |
+| How many clients share the budget | Observed: distinct keys seen in the activity window |
+| Floor and ceiling on the budget | **Configured** — bounded authority, by design |
+| Reaction speed and memory | **Configured** — control interval, window, half-life |
+| Anomaly sensitivity | **Configured** — one σ value |
+
+### How the limit is produced
+
+```
+limit = budget          discovered by the controller from latency and errors
+      x fair share      1 / observed active clients
+      x reputation      1.0, or σ/z when this client deviates from its own baseline
+```
+
+clamped to `[min-client-limit, max-budget]`. The smallest of the three factors is
+reported as `X-RateLimit-Reason`, so a rejected caller learns whether the system
+was under pressure, the tenant pool was crowded, or its own behaviour was the
+problem.
+
+### Two rules that keep it stable
+
+Most of the subtlety in an adaptive limiter is in what it refuses to do:
+
+1. **Learn only while healthy.** Baselines are updated on healthy ticks only. A
+   limiter that learns during an incident normalises the degradation and stops
+   protecting anything — the same trap applies per-client, where a sustained
+   flood would otherwise become the attacker's accepted normal.
+2. **Probe only while saturated.** The budget grows only when traffic is actually
+   using most of it. Otherwise an idle service drifts to its ceiling and admits a
+   flood the moment traffic returns.
+
+### Seeing it work
+
+Driving real traffic through a healthy service, then a degraded one, then
+recovery — with nothing reconfigured at any point:
+
+| Phase | Budget | Learned threshold | Observed p99 | State |
+|---|---|---|---|---|
+| Cold start | 20 (floor) | — | — | `SLOW_START` |
+| Fast traffic, saturating | **1280** | 16ms | 2ms | `SLOW_START` |
+| Dependency slows to 400ms | **20** | 16ms | 418ms | pressured, z=137 |
+| Dependency recovers | **33** | 16ms | 0ms | probing back additively |
+
+Nobody chose 16ms. The limiter measured what this service normally does and
+derived the threshold from it — and on recovery it climbs back by 5% steps rather
+than jumping to 1280 and re-breaking what just healed.
 
 ```
 ai/assistiv/ratelimiter/
-├── core/
-│   ├── RateLimiter.java             # admission check, cost-aware
-│   ├── TokenBucketRateLimiter.java  # lock-free CAS bucket, per key
-│   ├── LimitResolver.java           # <- the adaptive seam
-│   ├── StaticLimitResolver.java     #    today: a constant
-│   ├── RateLimitDecision.java       # allowed, limit, remaining, retry-after, reason
-│   ├── LimitReason.java             # quota | system-pressure | client-deviation | fair-share
-│   └── TimeSource.java              # injectable clock, so refill is testable
-├── config/                          # properties, bean wiring, idle-bucket sweep
-└── web/                             # filter, key resolver, demo endpoint
+├── core/                            enforcement — cheap, no thinking
+│   ├── RateLimiter.java             admission check, cost-aware
+│   ├── TokenBucketRateLimiter.java  lock-free CAS bucket, per key
+│   ├── LimitResolver.java           the seam between the two layers
+│   ├── ResolvedLimit.java           the limit, and which factor set it
+│   └── LimitReason.java             quota | system-pressure | client-deviation | fair-share
+├── adaptive/                        adaptation — all off the hot path
+│   ├── SlidingWindowTrafficMetrics  p99 / errors / throughput over a ring of slots
+│   ├── LatencyHistogram.java        fixed-memory percentiles
+│   ├── EwmaBaseline.java            learns normal, scores deviation
+│   ├── CapacityController.java      slow start, AIMD, bounded authority
+│   ├── ClientProfileRegistry.java   per-client baselines, fair-share population
+│   ├── AdaptiveLimitResolver.java   budget x share x reputation
+│   └── AdaptiveControlLoop.java     the tick
+├── config/                          properties, wiring, maintenance
+└── web/                             filter, key resolver, state endpoint, demo
 ```
 
 ---
 
 ## Status
 
-Early. The approach above is the target; a static token bucket is what runs today.
-See *What exists today* for the line between the two.
+The adaptive core is built and tested: 77 tests, including a closed-loop
+simulation that drives a service through health, degradation, and recovery on a
+fake clock. What remains is listed in the roadmap — priority tiers, real cost
+weighting, the middle steps of the degradation ladder, and shared state across
+instances.
