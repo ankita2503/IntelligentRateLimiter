@@ -1,371 +1,320 @@
 # IntelligentRateLimiter
 
-An adaptive, traffic-aware rate limiter. Instead of enforcing a fixed number that
-someone guessed months ago, it continuously derives the limit from what the system
-and its callers are actually doing right now.
+A rate limiter that sets its own limits by watching traffic, instead of enforcing
+a number someone typed into a config file months ago.
 
 ---
 
-## Why not a traditional rate limiter?
+## The problem with a normal rate limiter
 
-A classic limiter (fixed window, sliding window, token bucket) enforces a **static**
-budget — `1000 req/min per API key`. That number is a compromise, and it is wrong in
-both directions:
+A traditional limiter enforces a fixed number: `1000 requests/min per API key`.
+Someone picked that number once. It never changes.
 
-| Situation | Static limiter | Cost |
+That single number has to be right in every situation at once, and it can't be:
+
+| What's happening | What a fixed limiter does | Why that's bad |
 |---|---|---|
-| System is healthy and idle at 3am | Still caps at 1000 | Throws away capacity you paid for |
-| Downstream DB is degraded | Still admits 1000 | Turns a slow dependency into an outage |
-| One client bursts, everyone else is normal | Everyone hits the same cap | Noisy neighbor punishes good tenants |
-| Legitimate traffic doubles after a launch | Blocks real users | Manual config change + redeploy |
+| It's 3am, the system is idle | Still caps everyone at 1000 | You paid for capacity you're refusing to use |
+| The database is struggling | Still admits 1000 | A slow dependency becomes a full outage |
+| One customer floods you | Caps *everyone* at 1000 | Your good customers get punished for someone else's bug |
+| Traffic doubles after a launch | Blocks real users | Someone has to edit config and redeploy, at 2am |
 
-The limit is a control problem, not a constant. `IntelligentRateLimiter` treats it
-as one.
+The number is either too low (you throw away capacity) or too high (you fall over).
+Usually it's both, at different times of the same day.
 
----
-
-## Approach
-
-### 1. The limit is computed, not configured
-
-Every client gets an **effective budget** recalculated on a short interval
-(default: 1s):
-
-```
-effective_limit = base_limit
-                × health_factor      # how much headroom the system has
-                × fairness_share     # this client's slice of scarce capacity
-                × reputation_factor  # how well-behaved this client has been
-```
-
-Config supplies the *floor* and *ceiling* (`min_limit`, `max_limit`) and the SLO to
-protect. The controller picks the value in between.
-
-### 2. Closed-loop control on an SLO, not on a request count
-
-A feedback controller (AIMD by default, PID optional) drives the global admission
-budget toward a target signal — typically `p99 latency ≤ SLO` and `error_rate ≤ ε`:
-
-- **Healthy** (p99 well under target): additive increase — hand capacity back, let
-  traffic through.
-- **Stressed** (p99 crossing target, errors climbing, queue depth growing):
-  multiplicative decrease — shrink the budget fast.
-
-This is the same shape as TCP congestion control: slow to grant, fast to protect.
-The system finds the real capacity instead of trusting a hardcoded one.
-
-### 3. Traffic shape awareness
-
-Raw counts hide intent. Each caller is tracked as a short-horizon profile:
-
-- **EWMA baseline** of request rate, per client and per route.
-- **Burstiness** — variance against that baseline, so a spiky-but-small client is
-  not treated like a sustained flood.
-- **Cost weighting** — a request is charged by its actual expense (latency,
-  payload, downstream fan-out), not counted as `1`. A search query and a health
-  check should not consume the same budget.
-- **Deviation detection** — throttling triggers when a client departs from *its own*
-  established pattern, so a 10× spike from a normally-quiet key is caught even
-  though it is nowhere near the global cap.
-
-### 4. Fairness under scarcity
-
-When capacity is short, the limiter does not shed uniformly. It allocates by
-weighted fair share across tenants and priority tiers, so the client causing the
-pressure absorbs it. Well-behaved tenants keep their normal service level.
-
-### 5. Graceful degradation ladder
-
-Rejection is the last step, not the first:
-
-```
-admit fully
-  → admit, shed optional work (skip cache warm, drop enrichment)
-    → queue briefly with a deadline
-      → reject low-priority tiers
-        → reject with 429 + Retry-After
-```
-
-`Retry-After` is derived from the current recovery trajectory, so clients back off
-by a useful amount instead of a made-up constant.
+**The real problem:** how many requests you can safely handle is not a constant.
+It changes minute to minute with system health, who's calling, and what they're
+asking for. A constant can't track that.
 
 ---
 
-## Architecture
+## What we did about it
+
+We made the limit a **moving number that the system works out for itself**.
+
+Three questions get asked continuously, and the answers are multiplied together:
+
+1. **How much can the system take right now?** Measured from real latency and
+   error rates — not declared in config.
+2. **How many people are sharing it?** Counted from actual traffic.
+3. **Is this particular caller behaving normally?** Compared against that caller's
+   own history.
 
 ```
-        request
-           │
-           ▼
-   ┌───────────────┐      ┌──────────────────┐
-   │  Enforcement  │◄─────│ Decision Engine  │
-   │  (middleware) │      │  limit resolver  │
-   └───────┬───────┘      └────────┬─────────┘
-           │                       │ reads
-           │ emits                 ▼
-           │              ┌──────────────────┐
-           │              │  State Store     │
-           │              │  counters, EWMA, │
-           │              │  budgets (Redis) │
-           │              └────────▲─────────┘
-           ▼                       │ writes
-   ┌───────────────┐      ┌────────┴─────────┐
-   │  Telemetry    │─────►│  Controller      │
-   │  latency,errs │      │  AIMD / PID loop │
-   └───────────────┘      └──────────────────┘
+your limit = system capacity  x  your share of it  x  how normal you look
 ```
 
-- **Enforcement** — hot path only. One lookup, no computation. Must stay
-  sub-millisecond and fail open.
-- **Decision Engine** — resolves the effective limit for a given key from the
-  current budget, share, and reputation.
-- **State Store** — shared counters and rolling stats. Atomic via Lua scripts so
-  multiple instances agree.
-- **Telemetry** — samples latency, error rate, and queue depth from real traffic.
-- **Controller** — the only component allowed to move the budget. Runs off the hot
-  path on a fixed tick.
+Nobody configures any of those three. The limiter measures them.
 
 ---
 
-## Design principles
+## How it works, in plain terms
 
-1. **Fail open.** If the limiter, the store, or the controller is unavailable,
-   traffic is admitted at the last known good limit. A rate limiter must never be
-   the outage.
-2. **The hot path does no thinking.** All adaptation happens asynchronously; the
-   request path reads a precomputed number.
-3. **Bounded authority.** The controller can only move within `[min_limit,
-   max_limit]`. Adaptation cannot run away in either direction.
-4. **Explainable decisions.** Every response carries why it was limited — which
-   factor dominated, what the effective limit was, when to retry.
-5. **Observable by default.** Effective limit, health factor, and shed rate are
-   first-class metrics. An adaptive system you cannot see is an adaptive system you
-   cannot trust.
+### 1. It watches every request
 
----
+Each request that goes through gets timed, and its success or failure recorded.
+That's the raw material — how fast the system is answering, and how often it's
+failing.
 
-## Response contract
+### 2. It learns what "normal" looks like here
+
+This is the key idea, and it's what a traditional limiter can't do.
+
+The limiter keeps a running average of how slow this service usually is, and how
+much that varies. "Too slow" isn't a number in a config file — it means *slower
+than this service normally is*.
+
+A service that usually answers in 4ms and one that usually takes 800ms each end
+up with a threshold that fits them. Neither needed anyone to write it down.
+
+> In our test run, the limiter measured a service answering in ~2ms and settled
+> on 16ms as "something is wrong". Nobody chose 16ms.
+
+### 3. It finds the real capacity by carefully pushing
+
+Borrowed from how the internet handles congestion (TCP):
+
+- **Things are fine?** Give out more capacity. From cold, it doubles each second
+  until it finds the edge.
+- **Things are getting slow?** Cut the capacity in half, immediately.
+
+Generous when it can afford to be, and quick to pull back when it can't. Over
+time it settles around what the system can genuinely handle — which it discovered,
+not guessed.
+
+### 4. It splits capacity among whoever is actually here
+
+If one client is using the service, it can have all the capacity. If ten show up,
+they get a tenth each. When some leave, the rest get more.
+
+There's no tenant list to maintain. The limiter just counts who it has seen
+recently.
+
+### 5. It judges each caller against its own history
+
+A key that has quietly sent 2 requests/minute for a week, then suddenly sends 500
+per second, is *obviously* wrong — even though 500/s might be well within the
+system's limits.
+
+A fixed limiter can't see this. It only knows one number, and 500/s is under it.
+
+This limiter tracks each caller separately, so it can throttle the one that's
+behaving strangely and leave everyone else alone. And the throttle is a squeeze,
+not a ban — a suspected abuser is slowed to 10% of its share, never cut to zero,
+because sometimes it's a real customer having a real spike.
+
+### 6. Rejections explain themselves
+
+When a request is refused, the response says *which* of the three factors caused
+it:
 
 ```http
 HTTP/1.1 429 Too Many Requests
 Retry-After: 3
-X-RateLimit-Limit: 420          # effective limit right now, not the configured max
+X-RateLimit-Limit: 420            # what the limit actually is right now
 X-RateLimit-Remaining: 0
-X-RateLimit-Reset: 1712345678
-X-RateLimit-Reason: system-pressure   # or: client-deviation | fair-share | quota
+X-RateLimit-Reason: system-pressure
 ```
+
+`system-pressure` (the service is struggling), `fair-share` (lots of tenants
+right now), `client-deviation` (you're the one behaving oddly), or `quota` (you
+simply used your allowance). A caller can tell whether the problem is them or us.
 
 ---
 
-## Configuration
+## The two rules that stop it going wrong
 
-The interesting property is what is **absent**. There is no request-per-minute
-number, no latency SLO, no tenant list, no per-client quota — those are derived
-from traffic. What remains is of three kinds: safety rails, time constants, and
-one sensitivity dial.
+An adaptive system can adapt itself into a disaster. Two rules prevent the
+obvious ones, and both are covered by tests:
 
-```yaml
-ratelimiter:
-  refill-period: 1m
-  fail-mode: OPEN
-  key-header: X-API-Key
-  adaptive:
-    enabled: true
-    # Time constants: how fast to react, how long to remember.
-    control-interval: 1s
-    window: 30s
-    baseline-half-life: 5m
-    warmup-ticks: 20
-    # Safety rails: the controller moves freely between these and nowhere else.
-    min-budget: 50
-    max-budget: 5000
-    min-client-limit: 5
-    # Sensitivity: deviations above the learned baseline that count as anomalous.
-    deviation-sigma: 3.0
-    # Optional hard SLO. Zero means judge latency only against what it has been.
-    latency-ceiling: 0s
-```
+**It only learns while things are healthy.**
+If the limiter kept learning during an outage, "broken" would slowly become its
+idea of normal, and it would stop protecting anything. So when things look bad,
+it reacts but does not learn. The same applies per-caller: a sustained flood
+never becomes that caller's accepted baseline.
 
-Setting `adaptive.enabled: false` falls back to a fixed `ratelimiter.limit`,
-which is useful for comparison and for the enforcement tests.
+**It only grows the limit while the limit is actually being used.**
+Otherwise a quiet service would drift up to its ceiling overnight and then let a
+flood straight through the moment traffic returned.
+
+And a third, less clever but just as important: **the limiter fails open**. If
+any of this machinery breaks, traffic is admitted. A rate limiter must never be
+the thing that takes you down.
 
 ---
 
-## Roadmap
+## Seeing it work
 
-- [x] Core token bucket, per-client, in-memory
-- [x] Telemetry: sliding-window p99 latency, error rate, throughput, in-flight
-- [x] Learned baselines — the limiter discovers its own thresholds
-- [x] Slow-start + AIMD controller with bounded budget adjustment
-- [x] Per-client EWMA profiles and deviation detection
-- [x] Fair share across the observed client population
-- [x] Explainable denials (`X-RateLimit-Reason`) and a state endpoint
-- [ ] Weighted priority tiers on top of equal fair share
-- [ ] Cost-weighted accounting (the plumbing exists; every request charges 1)
-- [ ] Degradation ladder: shed-optional and queue steps before rejection
-- [ ] Distributed state, so instances share one budget
-- [ ] PID controller as an alternative strategy
-- [ ] Load-test harness: burst, sustained flood, noisy neighbour, degraded downstream
+Real traffic against a running server. Nothing was reconfigured between phases —
+the only thing that changed was how fast the service was responding:
+
+| What's happening | Limit it set | What it had learned | Actual p99 |
+|---|---|---|---|
+| Just started up | 20 (the floor) | nothing yet | — |
+| Healthy traffic, using all of it | **1280** | "normal is ~16ms" | 2ms |
+| Dependency slows to 400ms | **20** | still 16ms | 418ms |
+| Dependency recovers | **33** | still 16ms | 0ms |
+
+It found capacity on its own, collapsed when the dependency degraded, and then
+climbed back **gradually** rather than jumping straight to 1280 and re-breaking
+whatever had just recovered.
 
 ---
 
 ## Running it
 
-Requires JDK 21+ and Maven.
+Needs JDK 21+ and Maven.
 
 ```bash
-mvn test                                  # 15 tests, unit + integration
-mvn spring-boot:run                       # starts on :8080
+mvn test              # 77 tests
+mvn spring-boot:run   # starts on :8080
 ```
 
-Try the limit:
+Hit it and watch the headers:
 
 ```bash
-for i in $(seq 1 4); do
-  curl -s -o /dev/null -D - -H "X-API-Key: demo" http://localhost:8080/api/ping \
-    | grep -Ei "^(HTTP/|X-RateLimit|Retry-After)"
-done
+curl -si -H "X-API-Key: demo" localhost:8080/api/ping | grep -i "x-ratelimit"
 ```
 
-The fourth call returns `429` with `Retry-After` and a problem-details body.
-Override any setting on the command line:
+Ask the limiter what it currently believes:
 
 ```bash
-mvn spring-boot:run -Dspring-boot.run.arguments=--ratelimiter.limit=10
-```
-
-### Watching it adapt
-
-`/api/slow?ms=400` stands in for a degraded dependency, and
-`/actuator/ratelimiter` reports what the limiter has learned:
-
-```bash
-mvn spring-boot:run
-
-# what it currently believes
 curl -s localhost:8080/actuator/ratelimiter | python3 -m json.tool
+```
 
-# healthy load: the budget climbs
+`/api/slow?ms=400` pretends to be a struggling dependency, so you can watch the
+limit collapse and recover:
+
+```bash
+# healthy load — the limit climbs
 while true; do
   for i in $(seq 1 25); do curl -s -o /dev/null -H "X-API-Key: load" localhost:8080/api/ping & done
   wait
 done
 
-# then degrade the dependency and watch the budget collapse
+# now make it slow — the limit collapses
 while true; do
   for i in $(seq 1 25); do curl -s -o /dev/null -H "X-API-Key: load" "localhost:8080/api/slow?ms=400" & done
   wait
 done
 ```
 
-Shorten `window`, `baseline-half-life`, and `warmup-ticks` to see it react within
-seconds rather than minutes.
+Shorten `window`, `baseline-half-life`, and `warmup-ticks` to see it react in
+seconds instead of minutes.
 
 ---
 
-## What exists today
+## Configuration
 
-Both layers are built. Enforcement is a token bucket; the limit it enforces is
-produced by the adaptive layer on a one-second control loop.
+The interesting part is what's **not** here. No requests-per-minute. No latency
+target. No tenant list. No per-customer quotas. Those are all worked out from
+traffic.
 
-| Piece | Status |
-|---|---|
-| Token bucket with continuous refill, per client key | Done |
-| Servlet filter, response headers, `429` + problem details | Done |
-| Fail-open on limiter failure, idle bucket eviction | Done |
-| Sliding-window telemetry: p99, error rate, throughput, in-flight | Done |
-| Learned latency/error baselines — no configured SLO required | Done |
-| Slow-start + AIMD budget controller, bounded by rails | Done |
-| Per-client EWMA profiles and deviation scoring | Done |
-| Fair share across the observed client population | Done |
-| Explainable denials + `/actuator/ratelimiter` state endpoint | Done |
-| Weighted priority tiers | Not started — every client shares equally |
-| Cost-weighted accounting | Plumbed through `tryAcquire(key, cost)`, always 1 |
-| Shed-optional and queue steps of the degradation ladder | Not started |
-| Shared state across instances | Not started — buckets are per-process |
+What's left is three kinds of thing:
 
-### What is learned, and what is configured
+```yaml
+ratelimiter:
+  adaptive:
+    enabled: true
 
-This is the part that differs from a conventional limiter.
+    # 1. Safety rails — the limiter may move freely between these, and nowhere else.
+    min-budget: 50          # never throttle below this, however bad things look
+    max-budget: 5000        # never grant above this, however good things look
+    min-client-limit: 5     # never squeeze one caller below this
 
-| Quantity | Where it comes from |
-|---|---|
-| How much capacity exists | Discovered: slow start doubles the budget while healthy, AIMD from there |
-| What counts as "too slow" | Learned: EWMA mean + σ of this service's own p99 |
-| What counts as "too many errors" | Learned: same mechanism on error rate |
-| A client's normal request rate | Learned: EWMA per key, judged against itself |
-| How many clients share the budget | Observed: distinct keys seen in the activity window |
-| Floor and ceiling on the budget | **Configured** — bounded authority, by design |
-| Reaction speed and memory | **Configured** — control interval, window, half-life |
-| Anomaly sensitivity | **Configured** — one σ value |
+    # 2. Time constants — how fast to react, how long to remember.
+    control-interval: 1s
+    window: 30s
+    baseline-half-life: 5m
+    warmup-ticks: 20
 
-### How the limit is produced
+    # 3. Sensitivity — how far from normal counts as "something's wrong".
+    deviation-sigma: 3.0
 
-```
-limit = budget          discovered by the controller from latency and errors
-      x fair share      1 / observed active clients
-      x reputation      1.0, or σ/z when this client deviates from its own baseline
+    # Optional: a hard latency limit, if you genuinely have an SLO. Zero means
+    # "just compare against what this service normally does".
+    latency-ceiling: 0s
 ```
 
-clamped to `[min-client-limit, max-budget]`. The smallest of the three factors is
-reported as `X-RateLimit-Reason`, so a rejected caller learns whether the system
-was under pressure, the tenant pool was crowded, or its own behaviour was the
-problem.
+The rails are deliberate. An adaptive system with no bounds is an outage
+generator — it should be free to be clever *within* limits you can reason about.
 
-### Two rules that keep it stable
+Set `adaptive.enabled: false` to fall back to a plain fixed limit, which is handy
+for comparison.
 
-Most of the subtlety in an adaptive limiter is in what it refuses to do:
+---
 
-1. **Learn only while healthy.** Baselines are updated on healthy ticks only. A
-   limiter that learns during an incident normalises the degradation and stops
-   protecting anything — the same trap applies per-client, where a sustained
-   flood would otherwise become the attacker's accepted normal.
-2. **Probe only while saturated.** The budget grows only when traffic is actually
-   using most of it. Otherwise an idle service drifts to its ceiling and admits a
-   flood the moment traffic returns.
+## How it fits together
 
-### Seeing it work
+```
+   request
+      │
+      ▼
+ ┌──────────┐   asks "what's the limit for this caller?"   ┌──────────────┐
+ │  Filter  │ ──────────────────────────────────────────►  │   Resolver   │
+ │          │ ◄────────────────────────────────────────── │ capacity ×   │
+ └────┬─────┘            a number, and why                  │ share ×      │
+      │                                                     │ reputation   │
+      │ times the request, records success/failure          └──────▲───────┘
+      ▼                                                            │
+ ┌──────────┐        every second        ┌────────────────┐        │
+ │ Metrics  │ ─────────────────────────► │  Control loop  │ ───────┘
+ │ p99, errs│                            │ learn, adjust  │
+ └──────────┘                            └────────────────┘
+```
 
-Driving real traffic through a healthy service, then a degraded one, then
-recovery — with nothing reconfigured at any point:
-
-| Phase | Budget | Learned threshold | Observed p99 | State |
-|---|---|---|---|---|
-| Cold start | 20 (floor) | — | — | `SLOW_START` |
-| Fast traffic, saturating | **1280** | 16ms | 2ms | `SLOW_START` |
-| Dependency slows to 400ms | **20** | 16ms | 418ms | pressured, z=137 |
-| Dependency recovers | **33** | 16ms | 0ms | probing back additively |
-
-Nobody chose 16ms. The limiter measured what this service normally does and
-derived the threshold from it — and on recovery it climbs back by 5% steps rather
-than jumping to 1280 and re-breaking what just healed.
+The request path stays dumb and fast: it looks up a number that's already been
+worked out. All the thinking happens once a second, off to the side. If the
+thinking stops, the last known number keeps being enforced.
 
 ```
 ai/assistiv/ratelimiter/
-├── core/                            enforcement — cheap, no thinking
-│   ├── RateLimiter.java             admission check, cost-aware
-│   ├── TokenBucketRateLimiter.java  lock-free CAS bucket, per key
-│   ├── LimitResolver.java           the seam between the two layers
-│   ├── ResolvedLimit.java           the limit, and which factor set it
-│   └── LimitReason.java             quota | system-pressure | client-deviation | fair-share
-├── adaptive/                        adaptation — all off the hot path
-│   ├── SlidingWindowTrafficMetrics  p99 / errors / throughput over a ring of slots
-│   ├── LatencyHistogram.java        fixed-memory percentiles
-│   ├── EwmaBaseline.java            learns normal, scores deviation
-│   ├── CapacityController.java      slow start, AIMD, bounded authority
-│   ├── ClientProfileRegistry.java   per-client baselines, fair-share population
-│   ├── AdaptiveLimitResolver.java   budget x share x reputation
-│   └── AdaptiveControlLoop.java     the tick
-├── config/                          properties, wiring, maintenance
-└── web/                             filter, key resolver, state endpoint, demo
+├── core/         enforcement — the fast path
+│   ├── TokenBucketRateLimiter    counts requests, allows or denies
+│   ├── LimitResolver             "what's the limit?" — the seam between layers
+│   └── ResolvedLimit             the number, plus which factor set it
+├── adaptive/     the intelligence — all off the fast path
+│   ├── SlidingWindowTrafficMetrics   what's been happening recently
+│   ├── EwmaBaseline                  learns normal, spots deviation
+│   ├── CapacityController            finds capacity, backs off under pressure
+│   ├── ClientProfileRegistry         per-caller history and fair shares
+│   ├── AdaptiveLimitResolver         multiplies the three factors together
+│   └── AdaptiveControlLoop           runs once a second
+├── config/       settings and wiring
+└── web/          filter, key resolution, state endpoint, demo endpoints
 ```
+
+---
+
+## What's built, and what isn't
+
+Working today:
+
+- Token bucket enforcement, per caller, with continuous refill
+- Latency, error rate, throughput, and in-flight measurement
+- Learned health thresholds — no SLO required
+- Capacity discovery, and backing off under pressure
+- Per-caller profiles and deviation detection
+- Fair sharing across whoever is currently active
+- Self-explaining rejections and a state endpoint
+- Fails open, and forgets idle callers so memory stays bounded
+
+Not built yet:
+
+- **Priority tiers.** Everyone shares equally right now; premium customers can't
+  yet be told to absorb less of the pain.
+- **Cost weighting.** A search query and a health check currently cost the same.
+  The plumbing accepts a cost, but everything charges 1.
+- **The gentler steps before rejection.** Shedding optional work, or briefly
+  queuing, before a 429.
+- **Shared state across instances.** Each process has its own view, so two
+  replicas enforce two independent budgets.
+- **A PID controller** as an alternative to the current approach.
 
 ---
 
 ## Status
 
-The adaptive core is built and tested: 77 tests, including a closed-loop
-simulation that drives a service through health, degradation, and recovery on a
-fake clock. What remains is listed in the roadmap — priority tiers, real cost
-weighting, the middle steps of the degradation ladder, and shared state across
-instances.
+The adaptive core is built and tested — 77 tests, including a simulation that
+drives a service through health, degradation, and recovery on a fake clock so the
+behaviour is verified rather than hoped for.
