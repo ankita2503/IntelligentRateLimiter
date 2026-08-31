@@ -312,9 +312,3 @@ Not built yet:
 - **A PID controller** as an alternative to the current approach.
 
 ---
-
-## Status
-
-The adaptive core is built and tested — 77 tests, including a simulation that
-drives a service through health, degradation, and recovery on a fake clock so the
-behaviour is verified rather than hoped for.
