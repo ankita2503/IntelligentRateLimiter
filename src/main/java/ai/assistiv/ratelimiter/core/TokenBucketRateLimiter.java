@@ -65,7 +65,7 @@ public class TokenBucketRateLimiter implements RateLimiter {
 
             if (tokens < costScaled) {
                 // Not enough capacity. Publish the refill so the wait we quote
-                // stays accurate, but charge nothing.
+                // stays accurate, but charge nothing. The caller can retry after the quoted wait.
                 ref.compareAndSet(current, new Bucket(tokens, now));
                 long waitNanos = nanosToAccumulate(costScaled - tokens, capacityScaled);
                 long retryAfter = Math.max(1, ceilDiv(waitNanos, 1_000_000_000L));
