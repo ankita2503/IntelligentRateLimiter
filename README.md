@@ -310,5 +310,6 @@ Not built yet:
 - **Shared state across instances.** Each process has its own view, so two
   replicas enforce two independent budgets.
 - **A PID controller** as an alternative to the current approach.
+- **TO-DO** Other algorithms references needs a cleanup
 
 ---
