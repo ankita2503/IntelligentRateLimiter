@@ -311,5 +311,6 @@ Not built yet:
   replicas enforce two independent budgets.
 - **A PID controller** as an alternative to the current approach.
 - **TO-DO** Other algorithms references needs a cleanup
+- FixedWindow, LeakyBucket, TokenBucket
 
 ---
